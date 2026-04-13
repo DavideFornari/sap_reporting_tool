@@ -18,7 +18,8 @@
    - [6.1 Passo 1 — Destinazione HTTP in SM59](#61-passo-1--creare-la-destinazione-http-in-sm59)
    - [6.2 Passo 2 — Parametri API in ZBWJOB_CONFIG](#62-passo-2--inserire-i-parametri-api-in-zbwjob_config)
    - [6.3 Passo 3 — Regole di priorità in ZBWJOB_PRIORITY](#63-passo-3--configurare-le-regole-di-priorità-in-zbwjob_priority)
-   - [6.4 Requisiti minimi per il primo avvio](#64-requisiti-minimi-per-il-primo-avvio)
+   - [6.4 Passo 4 — Mailing list notifiche in ZBWJOB_MAILLIST](#64-passo-4--configurare-la-mailing-list-in-zbwjob_maillist)
+   - [6.5 Requisiti minimi per il primo avvio](#65-requisiti-minimi-per-il-primo-avvio)
 7. [Deploy e Sequenza di Attivazione](#7-deploy-e-sequenza-di-attivazione)
 8. [Schedulazione SM36](#8-schedulazione-sm36)
 9. [Gestione Errori](#9-gestione-errori)
@@ -42,6 +43,7 @@ Il sistema **ZBW Job Monitor** monitora automaticamente i job falliti su SAP BW4
 | Evitare ticket duplicati per lo stesso errore | Tabella di deduplication `ZBTW_TICKET_LOG` |
 | Assegnare priorità differenziate | Tabella customizing `ZBWJOB_PRIORITY` |
 | Essere indipendente dal sistema di ticketing | Interfaccia `ZIF_TICKET_PROVIDER` + factory |
+| Notificare via email i team responsabili all'apertura di un nuovo ticket | Tabella `ZBWJOB_MAILLIST` + classe `ZCL_BW_MAIL_NOTIFIER` (CL_BCS) |
 | Non abortire il job in caso di errore parziale | Gestione eccezioni per-item con log |
 
 ### Flusso operativo ad alto livello
@@ -58,11 +60,15 @@ ZBW_JOB_MONITOR
        │
        ├──► ZCL_TICKET_DEDUP ──► ZBTW_TICKET_LOG  (deduplication)
        │
-       └──► ZCL_TICKET_FACTORY
-                  │
-                  └──► ZCL_TICKET_HTTP_CLIENT ──► REST API esterna
-                             │
-                             └── ZBWJOB_CONFIG  (URL, token, timeout)
+       ├──► ZCL_TICKET_FACTORY
+       │          │
+       │          └──► ZCL_TICKET_HTTP_CLIENT ──► REST API esterna
+       │                     │
+       │                     └── ZBWJOB_CONFIG  (URL, token, timeout)
+       │
+       └──► ZCL_BW_MAIL_NOTIFIER ──► CL_BCS (SAP Mail)
+                    │
+                    └── ZBWJOB_MAILLIST  (destinatari per tipo/pattern)
 ```
 
 ---
@@ -84,8 +90,8 @@ ZBW_JOB_MONITOR
 │  ZCL_BW_JOB_READER      ZCL_TICKET_DEDUP               │
 │  (lettura job falliti)   (deduplication log)            │
 │                                                         │
-│  ZCL_TICKET_FACTORY                                     │
-│  (creazione provider)                                   │
+│  ZCL_TICKET_FACTORY     ZCL_BW_MAIL_NOTIFIER           │
+│  (creazione provider)    (notifiche email)              │
 └────────────────────────┬────────────────────────────────┘
                          │ implementa
 ┌────────────────────────▼────────────────────────────────┐
@@ -99,7 +105,7 @@ ZBW_JOB_MONITOR
 ┌────────────────────────▼────────────────────────────────┐
 │                    LAYER: PERSISTENZA (SE11)             │
 │  ZBTW_FAIL_JOB    ZBTW_TICKET_LOG                       │
-│  ZBWJOB_PRIORITY  ZBWJOB_CONFIG                         │
+│  ZBWJOB_PRIORITY  ZBWJOB_CONFIG   ZBWJOB_MAILLIST       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -219,6 +225,39 @@ ZBW_JOB_MONITOR
 
 ---
 
+### 3.5 Tabella `ZBWJOB_MAILLIST`
+
+**Tipo:** Transparent Table — Categoria C (Customizing), Delivery Class G.  
+**Manutenzione:** SM30 → vista da creare in SE54.
+
+**Chiave primaria:** `MANDT` + `JOB_TYPE` + `CHAIN_PATTERN` + `EMAIL`
+
+| Campo | Tipo | Ch. | Descrizione |
+|-------|------|-----|-------------|
+| `MANDT` | `MANDT` | ✓ | Client SAP |
+| `JOB_TYPE` | `CHAR10` | ✓ | Tipo oggetto: `BGDJOB` \| `CHAIN` \| `DTP` \| `*` (tutti) |
+| `CHAIN_PATTERN` | `CHAR100` | ✓ | Pattern sul nome del job/chain (es. `ZBW_FIN*`), oppure `*` per tutti |
+| `EMAIL` | `CHAR241` | ✓ | Indirizzo email del destinatario |
+| `ACTIVE` | `XFELD` | | `X` = notifica attiva |
+
+**Logica di matching in `ZCL_BW_MAIL_NOTIFIER→get_recipients()`:**
+1. Seleziona tutte le righe con `ACTIVE = X` e `JOB_TYPE IN ('*', <tipo attuale>)`
+2. Per ogni riga, verifica che il nome del job soddisfi `CHAIN_PATTERN` tramite `CP` (contains pattern)
+3. Gli indirizzi corrispondenti vengono deduplicati (SORT + DELETE ADJACENT DUPLICATES) prima dell'invio
+
+> Una stessa email può matchare più regole: la deduplication garantisce che ogni destinatario riceva una sola notifica per incident.
+
+**Esempi di configurazione:**
+
+| JOB_TYPE | CHAIN_PATTERN | EMAIL | Effetto |
+|----------|---------------|-------|---------|
+| `*` | `*` | `ops@azienda.com` | Notifica ops per qualsiasi tipo e qualsiasi nome |
+| `CHAIN` | `ZBW_FIN*` | `finance@azienda.com` | Solo process chain Finance |
+| `DTP` | `*` | `dtp-team@azienda.com` | Tutti i DTP falliti |
+| `BGDJOB` | `ZBW_HR_LOAD*` | `hr-it@azienda.com` | Solo job HR |
+
+---
+
 ## 4. Interfacce e Classi ABAP
 
 ### 4.1 Interfaccia `ZIF_TICKET_PROVIDER`
@@ -285,9 +324,10 @@ RSPCLOGENTRY:  LOGID + SEVERITY = 'E' → MESSAGE come ERROR_MSG
 
 **Data Transfer Processes (`RSBKREQUEST`):**
 ```
-RSBKREQUEST:  STATUS = 'E'
+RSBKREQUEST:  STATUS = '8'  (valore assunto — TODO #1: verificare in SE11)
               TIMESTAMP >= timestamp lookback
-              DTPNAME → JOBNAME, REQUID → parte dell'OBJECT_KEY
+              GROUP BY dtpname → un record per DTP, indipendentemente dai pacchetti paralleli
+              DTPNAME → JOBNAME e OBJECT_KEY  (senza REQUID per evitare un ticket per pacchetto)
               MSGV1 → ERROR_MSG
 ```
 
@@ -400,6 +440,55 @@ DATA(lo_provider) = zcl_ticket_factory=>get_provider( ).
 
 ---
 
+### 4.6 Classe `ZCL_BW_MAIL_NOTIFIER`
+
+**Scopo:** Invia una email di notifica ai destinatari configurati in `ZBWJOB_MAILLIST` ogni volta che viene aperto un **nuovo** ticket. Non viene invocata su UPDATE o CLOSE.
+
+**File:** [src/ZCL_BW_MAIL_NOTIFIER.clas.abap](src/ZCL_BW_MAIL_NOTIFIER.clas.abap)
+
+**Visibilità:** `PUBLIC FINAL CREATE PUBLIC`  
+**Dipendenza SAP:** `CL_BCS` / `CL_DOCUMENT_BCS` / `CL_INTERNET_ADDRESS_BCS` (ABAP Messaging Services)
+
+#### Metodo pubblico
+
+| Metodo | Parametri | Descrizione |
+|--------|-----------|-------------|
+| `notify_new_ticket(is_job, iv_ticket_id)` | — | Entry point: recupera destinatari, costruisce body, invia tramite CL_BCS |
+
+#### Metodi privati
+
+| Metodo | Descrizione |
+|--------|-------------|
+| `get_recipients(is_job)` | SELECT su `ZBWJOB_MAILLIST`, filtraggio per job type e CP pattern, dedup indirizzi |
+| `get_job_name(is_job)` | Restituisce `chain_id` se presente, altrimenti `jobname`, altrimenti `object_key` |
+| `build_mail_body(is_job, iv_ticket_id, iv_job_name)` | Costruisce il corpo testuale (`bcsy_text`) con i campi dell'incident |
+
+#### Esempio corpo email generato
+
+```
+BW4HANA Job Monitor - Incident Notification
+----------------------------------------------
+
+Ticket ID  : TKT-00123
+Job Name   : ZBW_FINANCE_CLOSE
+Job Type   : CHAIN
+Priority   : HIGH
+Failed at  : 20260413140000
+
+Error Message:
+Step LOAD_GL_DATA ended with error: database connection lost
+
+Object Key : ZBW_FINANCE_CLOSE_000000001234
+
+This is an automated message from ZBW_JOB_MONITOR.
+```
+
+#### Gestione errori
+
+Gli errori di invio email (`CX_BCS`) vengono catturati internamente e loggati con `WRITE: [MAIL-ERR]`. L'eccezione non viene mai propagata al report principale: un problema SMTP non deve bloccare la creazione del ticket.
+
+---
+
 ## 5. Report e Programmi
 
 ### 5.1 Report `ZBW_JOB_MONITOR`
@@ -427,7 +516,7 @@ START-OF-SELECTION
   │
   ├─ 2. Se LT_ALL_JOBS è vuota → WRITE messaggio → RETURN
   │
-  ├─ 3. Istanzia ZCL_TICKET_DEDUP e ZCL_TICKET_FACTORY=>get_provider()
+  ├─ 3. Istanzia ZCL_TICKET_DEDUP, ZCL_TICKET_FACTORY=>get_provider() e ZCL_BW_MAIL_NOTIFIER
   │       Legge PACKET_SIZE da ZBWJOB_CONFIG (0 = illimitato)
   │
   ├─ 4. LOOP AT LT_ALL_JOBS:
@@ -447,6 +536,7 @@ START-OF-SELECTION
   │       │     │
   │       │     └─ NO:  create_ticket() + save_new_ticket()  [se P_TEST=' ']
   │       │             COMMIT WORK AND WAIT
+  │       │             notify_new_ticket(is_job, lv_new_id)  ← ZBWJOB_MAILLIST
   │       │             WRITE: [CREATE] ticket_id - object_key (prio)
   │       │
   │       └─ CATCH cx_static_check → WRITE [ERROR] + MESSAGE 'I'
@@ -639,7 +729,49 @@ ZBW_TEST*             │ LOW      │ X      │ Job di test/sviluppo
 
 ---
 
-### 6.4 Requisiti minimi per il primo avvio
+### 6.4 Passo 4 — Configurare la mailing list in ZBWJOB_MAILLIST
+
+> Questo passo è **opzionale**. Se la tabella è vuota, nessuna email viene inviata ma il monitor funziona normalmente.
+
+**Cosa ti serve prima di iniziare:**
+- Indirizzi email dei team da notificare
+- SAP configurato per l'invio email (transazione SCOT — da verificare con il team Basis)
+
+**Step 4.1 — Aprire la vista di manutenzione**
+1. Aprire la transazione **SM30**
+2. Inserire il nome della vista di manutenzione di `ZBWJOB_MAILLIST`
+3. Cliccare **Maintain**
+
+**Step 4.2 — Inserire le regole di notifica**
+
+Cliccare **Nuova voce** per ogni combinazione tipo/pattern/email:
+
+| Campo | Cosa inserire |
+|-------|--------------|
+| `JOB_TYPE` | `BGDJOB`, `CHAIN`, `DTP` oppure `*` per qualsiasi tipo |
+| `CHAIN_PATTERN` | Nome esatto o pattern con `*` (stesso formato di `ZBWJOB_PRIORITY`) |
+| `EMAIL` | Indirizzo email del destinatario (max 241 caratteri) |
+| `ACTIVE` | `X` per abilitare la riga |
+
+> La stessa email può apparire in più righe (es. un indirizzo generico `ops@` e uno specifico per Finance): la classe `ZCL_BW_MAIL_NOTIFIER` deduplicha automaticamente i destinatari prima dell'invio.
+
+**Esempio di configurazione:**
+
+```
+JOB_TYPE │ CHAIN_PATTERN   │ EMAIL                     │ ACTIVE
+─────────┼─────────────────┼───────────────────────────┼───────
+*        │ *               │ ops-bw@azienda.com         │ X
+CHAIN    │ ZBW_FIN*        │ finance-it@azienda.com     │ X
+DTP      │ *               │ dtp-monitoring@azienda.com │ X
+BGDJOB   │ ZBW_HR*         │ hr-it@azienda.com          │ X
+```
+
+**Step 4.3 — Salvare**
+1. Cliccare **Salva** (Ctrl+S)
+
+---
+
+### 6.5 Requisiti minimi per il primo avvio
 
 Se vuoi avviare il monitor il prima possibile, i passi strettamente necessari sono:
 
@@ -664,7 +796,8 @@ Seguire rigorosamente questa sequenza per evitare errori di dipendenza:
 3. Creare e attivare `ZBTW_TICKET_LOG` (Tabella)
 4. Creare e attivare `ZBWJOB_PRIORITY` (Tabella)
 5. Creare e attivare `ZBWJOB_CONFIG` (Tabella)
-6. Eseguire conversione dati (SE14) se necessario
+6. Creare e attivare `ZBWJOB_MAILLIST` (Tabella)
+7. Eseguire conversione dati (SE14) se necessario
 
 ### Step 2 — Destinazione SM59
 
@@ -687,6 +820,7 @@ Seguire rigorosamente questa sequenza per evitare errori di dipendenza:
 2. `ZCL_TICKET_DEDUP` — dipende da `ZBTW_TICKET_LOG`
 3. `ZCL_TICKET_HTTP_CLIENT` — implementa `ZIF_TICKET_PROVIDER`
 4. `ZCL_TICKET_FACTORY` — dipende da `ZCL_TICKET_HTTP_CLIENT` e `ZBWJOB_CONFIG`
+5. `ZCL_BW_MAIL_NOTIFIER` — dipende da `ZBWJOB_MAILLIST` e `CL_BCS`
 
 ### Step 6 — Report (SE38)
 
@@ -851,9 +985,11 @@ Nessuna modifica al report `ZBW_JOB_MONITOR` o alle altre classi.
 2. Implementare la logica di SELECT sulla tabella SAP corrispondente
 3. In `ZBW_JOB_MONITOR`, aggiungere `APPEND LINES OF lo_reader->get_failed_<tipo>( p_lkbk ) TO lt_all_jobs`
 
-### Notifiche email aggiuntive
+### Modificare o estendere le regole di notifica email
 
-Aggiungere un secondo step nel LOOP di `ZBW_JOB_MONITOR` che chiama `SO_NEW_DOCUMENT_SEND_API1` per i job con `PRIORITY = 'HIGH'`, senza modificare la logica di ticketing.
+Le regole di destinazione sono in `ZBWJOB_MAILLIST` e vengono lette a runtime: nessuna modifica al codice è necessaria per aggiungere o rimuovere destinatari. Per aggiungere un nuovo criterio di filtraggio (es. notifica solo per `PRIORITY = 'HIGH'`), estendere `ZCL_BW_MAIL_NOTIFIER→get_recipients()` o `notify_new_ticket()` con la logica aggiuntiva.
+
+> **Prerequisito infrastrutturale:** il server ABAP deve essere configurato per l'invio email tramite SCOT (transazione SAP). Coinvolgere il team Basis prima di attivare le notifiche in produzione.
 
 ---
 
@@ -865,11 +1001,13 @@ Aggiungere un secondo step nel LOOP di `ZBW_JOB_MONITOR` che chiama `SO_NEW_DOCU
 | `ZBTW_TICKET_LOG` | Transparent Table | Log deduplication ticket |
 | `ZBWJOB_PRIORITY` | Transparent Table | Regole di priorità per pattern |
 | `ZBWJOB_CONFIG` | Transparent Table | Parametri connessione API |
+| `ZBWJOB_MAILLIST` | Transparent Table | Regole mailing list per tipo/pattern |
 | `ZIF_TICKET_PROVIDER` | Interface | Contratto provider ticketing |
 | `ZCL_BW_JOB_READER` | Class | Lettore job falliti da SAP standard |
 | `ZCL_TICKET_DEDUP` | Class | Gestore deduplication ticket |
 | `ZCL_TICKET_HTTP_CLIENT` | Class | Implementazione REST generica |
 | `ZCL_TICKET_FACTORY` | Class | Factory per il provider |
+| `ZCL_BW_MAIL_NOTIFIER` | Class | Invio email notifiche via CL_BCS |
 | `ZBW_JOB_MONITOR` | Report | Orchestratore principale (SM36) |
 | `ZBW_TICKET_STATUS` | Report | Consultazione ALV + close manuale |
 

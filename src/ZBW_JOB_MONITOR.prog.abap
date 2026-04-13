@@ -19,6 +19,7 @@ START-OF-SELECTION.
   DATA: lo_reader      TYPE REF TO zcl_bw_job_reader,
         lo_dedup       TYPE REF TO zcl_ticket_dedup,
         lo_provider    TYPE REF TO zif_ticket_provider,
+        lo_notifier    TYPE REF TO zcl_bw_mail_notifier,
         lt_all_jobs    TYPE STANDARD TABLE OF zbtw_fail_job WITH DEFAULT KEY,
         ls_job         TYPE zbtw_fail_job,
         lv_existing    TYPE char50,
@@ -49,9 +50,10 @@ START-OF-SELECTION.
       WRITE: / |Found { lines( lt_all_jobs ) } failed object(s). Processing...|.
       SKIP.
 
-      " --- 2. Instantiate dedup manager and ticket provider ---
+      " --- 2. Instantiate dedup manager, ticket provider and mail notifier ---
       lo_dedup    = NEW zcl_ticket_dedup( ).
       lo_provider = zcl_ticket_factory=>get_provider( ).
+      lo_notifier = NEW zcl_bw_mail_notifier( ).
 
       " --- 2b. Read optional processing cap from config (0 = unlimited) ---
       SELECT SINGLE config_value FROM zbwjob_config
@@ -110,6 +112,10 @@ START-OF-SELECTION.
                   is_job       = ls_job
                   iv_ticket_id = lv_new_id ).
                 COMMIT WORK AND WAIT.
+                " Notify mailing list - errors are caught internally, never block flow
+                lo_notifier->notify_new_ticket(
+                  is_job       = ls_job
+                  iv_ticket_id = lv_new_id ).
               ELSE.
                 lv_new_id = '[TEST - not created]'.
               ENDIF.
