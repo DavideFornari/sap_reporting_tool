@@ -7,14 +7,16 @@ CLASS zcl_ticket_http_client DEFINITION
     INTERFACES zif_ticket_provider.
 
     METHODS:
-      "! @parameter iv_api_url   | Full REST endpoint URL
-      "! @parameter iv_api_token | Bearer token for Authorization header
-      "! @parameter iv_timeout   | HTTP send timeout in seconds (default 30)
+      "! @parameter iv_destination | SM59 RFC destination name (stores host, port, SSL)
+      "! @parameter iv_api_path    | Base path of the tickets endpoint (e.g. /api/v1/tickets)
+      "! @parameter iv_api_token   | Bearer token for Authorization header
+      "! @parameter iv_timeout     | HTTP send timeout in seconds (default 30)
       constructor
         IMPORTING
-          iv_api_url   TYPE char255
-          iv_api_token TYPE char255
-          iv_timeout   TYPE i DEFAULT 30.
+          iv_destination TYPE char50
+          iv_api_path    TYPE char255
+          iv_api_token   TYPE char255
+          iv_timeout     TYPE i DEFAULT 30.
 
   PRIVATE SECTION.
     TYPES:
@@ -34,9 +36,10 @@ CLASS zcl_ticket_http_client DEFINITION
       END OF ty_update_payload.
 
     DATA:
-      mv_api_url   TYPE char255,
-      mv_api_token TYPE char255,
-      mv_timeout   TYPE i.
+      mv_destination TYPE char50,
+      mv_api_path    TYPE char255,
+      mv_api_token   TYPE char255,
+      mv_timeout     TYPE i.
 
     METHODS:
       build_create_payload
@@ -53,7 +56,7 @@ CLASS zcl_ticket_http_client DEFINITION
 
       execute_http_post
         IMPORTING
-          iv_url             TYPE char255
+          iv_path            TYPE string
           iv_payload         TYPE string
         RETURNING
           VALUE(rv_response) TYPE string
@@ -72,24 +75,25 @@ ENDCLASS.
 CLASS zcl_ticket_http_client IMPLEMENTATION.
 
   METHOD constructor.
-    mv_api_url   = iv_api_url.
-    mv_api_token = iv_api_token.
-    mv_timeout   = iv_timeout.
+    mv_destination = iv_destination.
+    mv_api_path    = iv_api_path.
+    mv_api_token   = iv_api_token.
+    mv_timeout     = iv_timeout.
   ENDMETHOD.
 
 
   METHOD zif_ticket_provider~create_ticket.
     DATA(lv_json)     = build_create_payload( is_job ).
-    DATA(lv_response) = execute_http_post( iv_url     = mv_api_url
+    DATA(lv_response) = execute_http_post( iv_path    = mv_api_path
                                            iv_payload = lv_json ).
     rv_ticket_id = parse_ticket_id( lv_response ).
   ENDMETHOD.
 
 
   METHOD zif_ticket_provider~update_ticket.
-    DATA(lv_url)  = |{ mv_api_url }/{ iv_ticket_id }|.
+    DATA(lv_path) = |{ mv_api_path }/{ iv_ticket_id }|.
     DATA(lv_json) = build_update_payload( iv_message ).
-    execute_http_post( iv_url     = lv_url
+    execute_http_post( iv_path    = lv_path
                        iv_payload = lv_json ).
   ENDMETHOD.
 
@@ -99,22 +103,27 @@ CLASS zcl_ticket_http_client IMPLEMENTATION.
           lv_status_code TYPE i,
           lv_reason      TYPE string.
 
-    cl_http_client=>create_by_url(
+    cl_http_client=>create_by_destination(
       EXPORTING
-        url                = |{ mv_api_url }/{ iv_ticket_id }|
+        destination              = mv_destination
       IMPORTING
-        client             = lo_http_client
+        client                   = lo_http_client
       EXCEPTIONS
-        argument_not_found = 1
-        plugin_not_active  = 2
-        internal_error     = 3
-        OTHERS             = 4 ).
+        argument_not_found       = 1
+        destination_not_found    = 2
+        destination_no_authority = 3
+        plugin_not_active        = 4
+        internal_error           = 5
+        OTHERS                   = 6 ).
 
     IF sy-subrc <> 0.
       RAISE EXCEPTION TYPE cx_static_check.
     ENDIF.
 
     lo_http_client->request->set_method( 'GET' ).
+    lo_http_client->request->set_header_field(
+      name  = '~request_uri'
+      value = |{ mv_api_path }/{ iv_ticket_id }| ).
     lo_http_client->request->set_header_field(
       name  = 'Authorization'
       value = |Bearer { mv_api_token }| ).
@@ -190,22 +199,27 @@ CLASS zcl_ticket_http_client IMPLEMENTATION.
           lv_status_code TYPE i,
           lv_reason      TYPE string.
 
-    cl_http_client=>create_by_url(
+    cl_http_client=>create_by_destination(
       EXPORTING
-        url                = iv_url
+        destination              = mv_destination
       IMPORTING
-        client             = lo_http_client
+        client                   = lo_http_client
       EXCEPTIONS
-        argument_not_found = 1
-        plugin_not_active  = 2
-        internal_error     = 3
-        OTHERS             = 4 ).
+        argument_not_found       = 1
+        destination_not_found    = 2
+        destination_no_authority = 3
+        plugin_not_active        = 4
+        internal_error           = 5
+        OTHERS                   = 6 ).
 
     IF sy-subrc <> 0.
       RAISE EXCEPTION TYPE cx_static_check.
     ENDIF.
 
     lo_http_client->request->set_method( 'POST' ).
+    lo_http_client->request->set_header_field(
+      name  = '~request_uri'
+      value = iv_path ).
     lo_http_client->request->set_header_field(
       name  = 'Content-Type'
       value = 'application/json' ).

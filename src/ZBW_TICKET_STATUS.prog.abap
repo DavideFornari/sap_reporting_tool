@@ -114,13 +114,14 @@ CLASS lcl_alv_events IMPLEMENTATION.
       UPDATE zbtw_ticket_log
         SET ticket_status = 'CLOSED'
             updated_at    = lv_ts
-        WHERE object_key = ls_log-object_key
-          AND log_date   = ls_log-log_date.
+        WHERE object_key = ls_log-object_key.
 
       ls_log-ticket_status = 'CLOSED'.
       ls_log-updated_at    = lv_ts.
       MODIFY gt_log FROM ls_log INDEX lv_index.
     ENDLOOP.
+
+    COMMIT WORK.
 
     " Refresh ALV display to reflect status changes
     go_alv->refresh( ).

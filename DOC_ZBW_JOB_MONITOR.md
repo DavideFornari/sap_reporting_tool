@@ -204,8 +204,9 @@ ZBW_JOB_MONITOR
 
 | CONFIG_KEY | Valore esempio | Descrizione |
 |------------|---------------|-------------|
-| `API_URL` | `https://tickets.azienda.com/api/v1/tickets` | Endpoint REST base |
-| `API_TOKEN` | `eyJhbGci...` | Bearer token di autenticazione |
+| `SM59_DEST` | `ZBWJOB_TICKETS` | Nome della destinazione RFC HTTP creata in SM59 (sostituisce `API_URL`) |
+| `API_PATH` | `/api/v1/tickets` | Path base dell'endpoint REST (separato dall'host gestito in SM59) |
+| `API_TOKEN` | `eyJhbGci...` | Bearer token di autenticazione (candidato a migrazione in SECSTORE) |
 | `TIMEOUT_SEC` | `30` | Timeout HTTP in secondi |
 | `MAX_RETRY` | `3` | Numero massimo di tentativi (informativo) |
 | `SYSTEM_ID` | `BW4PRD` | Identificativo sistema nel payload ticket |
@@ -263,16 +264,18 @@ Tutti i metodi sollevano `cx_static_check` in caso di errore (HTTP failure, risp
 ```
 TBTCO:  STATUS = 'A' (aborted)
         STRTDATE >= data calcolata da lookback
-JOIN
+FOR ALL ENTRIES
 TBTCP:  JOBNAME + JOBCOUNT → campo DYNDTEXT come ERROR_MSG
+        (bulk SELECT, poi READ TABLE con SORTED KEY per evitare N+1)
 ```
 
 **Process Chains (`RSPCLOGCHAIN` / `RSPCLOGENTRY`):**
 ```
 RSPCLOGCHAIN:  LOGSTATE IN ('E', 'A')
                STARTTIME >= timestamp lookback
-JOIN
+FOR ALL ENTRIES
 RSPCLOGENTRY:  LOGID + SEVERITY = 'E' → MESSAGE come ERROR_MSG
+               (bulk SELECT in SORTED TABLE con NON-UNIQUE KEY logid)
 ```
 
 **Data Transfer Processes (`RSBKREQUEST`):**
@@ -318,9 +321,10 @@ RSBKREQUEST:  STATUS = 'E'
 
 ```abap
 NEW zcl_ticket_http_client(
-  iv_api_url   = 'https://...'
-  iv_api_token = 'Bearer eyJ...'
-  iv_timeout   = 30 ).
+  iv_destination = 'ZBWJOB_TICKETS'   " SM59 RFC destination name
+  iv_api_path    = '/api/v1/tickets'  " base path, set via ~request_uri
+  iv_api_token   = 'eyJ...'
+  iv_timeout     = 30 ).
 ```
 
 #### Payload JSON inviato su `create_ticket`
@@ -357,13 +361,14 @@ Il metodo `parse_ticket_id()` cerca in sequenza:
 
 | Aspetto | Implementazione |
 |---------|----------------|
-| Client HTTP | `cl_http_client=>create_by_url()` |
+| Client HTTP | `cl_http_client=>create_by_destination()` — host, porta e SSL gestiti in SM59 |
+| Path endpoint | Header `~request_uri` impostato su `mv_api_path` (o `mv_api_path/ticket_id` per update/get) |
 | Header Auth | `Authorization: Bearer <token>` |
 | Content-Type | `application/json` |
 | Popup logon | `co_disabled` — disabilitato per esecuzione background |
 | Timeout | Passato a `send( EXPORTING timeout = mv_timeout )` |
 | Codici successo | 200 e 201; qualsiasi altro codice → `RAISE cx_static_check` |
-| Serializzazione JSON | `/ui2/cl_json=>serialize()` su strutture tipizzate (`ty_create_payload`, `ty_update_payload`). Garantisce escape corretto di `"`, `\`, newline, tab e tutti i caratteri di controllo. Sostituisce la precedente concatenazione manuale di stringhe. |
+| Serializzazione JSON | `/ui2/cl_json=>serialize()` su strutture tipizzate (`ty_create_payload`, `ty_update_payload`). Garantisce escape corretto di `"`, `\`, newline, tab e tutti i caratteri di controllo. |
 
 ---
 
@@ -380,9 +385,11 @@ DATA(lo_provider) = zcl_ticket_factory=>get_provider( ).
 ```
 
 **Logica interna di `get_provider()`:**
-1. Legge `ZBWJOB_CONFIG` per `API_URL`, `API_TOKEN`, `TIMEOUT_SEC`
+1. Legge `ZBWJOB_CONFIG` per `SM59_DEST`, `API_PATH`, `API_TOKEN`, `TIMEOUT_SEC`
 2. Se `TIMEOUT_SEC` è vuoto o zero → default 30 secondi
-3. Istanzia e ritorna `ZCL_TICKET_HTTP_CLIENT`
+3. Istanzia e ritorna `ZCL_TICKET_HTTP_CLIENT` con destinazione SM59 e path
+
+> **Sicurezza:** `API_TOKEN` è ancora letto da `ZBWJOB_CONFIG`. Per ambienti produttivi, migrarlo in `SECSTORE` / `CL_SECURE_STORE_SMC` e aggiornare la factory di conseguenza.
 
 > **Estensione futura:** aggiungere `CONFIG_KEY = 'PROVIDER_TYPE'` (es. `JIRA`, `SERVICENOW`) e un `CASE` nella factory per scegliere l'implementazione.
 
@@ -426,13 +433,15 @@ START-OF-SELECTION
   │       │     │
   │       │     ├─ SÌ:  [se P_TEST=' ']
   │       │     │         get_ticket_status()  → stato nel sistema esterno?
-  │       │     │           ├─ CLOSED: mark_ticket_closed()
+  │       │     │           ├─ CLOSED: mark_ticket_closed() → COMMIT WORK AND WAIT
   │       │     │           │          WRITE: [SYNC] ticket chiuso esternamente
   │       │     │           └─ OPEN:   update_ticket() + mark_ticket_updated()
+  │       │     │                      COMMIT WORK AND WAIT
   │       │     │                      WRITE: [UPDATE] ticket_id - object_key
   │       │     │         [se P_TEST='X'] WRITE: [UPDATE] (simulato)
   │       │     │
   │       │     └─ NO:  create_ticket() + save_new_ticket()  [se P_TEST=' ']
+  │       │             COMMIT WORK AND WAIT
   │       │             WRITE: [CREATE] ticket_id - object_key (prio)
   │       │
   │       └─ CATCH cx_static_check → WRITE [ERROR] + MESSAGE 'I'
@@ -472,10 +481,11 @@ Utile per validare la lettura dei log SAP senza effetti collaterali.
 - Toolbar standard attiva (export Excel/PDF, filtri, sort)
 - **Pulsante custom "Close Ticket"** nella toolbar destra:
   1. Recupera le righe selezionate via `cl_salv_selections`
-  2. Esegue `UPDATE ZBTW_TICKET_LOG SET TICKET_STATUS = 'CLOSED'` per ogni riga
+  2. Esegue `UPDATE ZBTW_TICKET_LOG SET TICKET_STATUS = 'CLOSED'` per ogni riga (WHERE `OBJECT_KEY` — non usa più `LOG_DATE` che non è più chiave)
   3. Aggiorna `UPDATED_AT` con il timestamp corrente
-  4. Chiama `go_alv->refresh()` per riflettere i cambiamenti in-place
-  5. Mostra un messaggio `'N ticket(s) closed.'`
+  4. Emette `COMMIT WORK` per persistere tutte le modifiche prima del refresh
+  5. Chiama `go_alv->refresh()` per riflettere i cambiamenti in-place
+  6. Mostra un messaggio `'N ticket(s) closed.'`
 
 ---
 
@@ -488,7 +498,8 @@ Aprire la transazione SM30, inserire il nome della vista di manutenzione di `ZBW
 ```
 CONFIG_KEY    │ CONFIG_VALUE                              │ DESCRIPTION
 ──────────────┼───────────────────────────────────────────┼─────────────────────────
-API_URL       │ https://yourticket.com/api/v1/tickets     │ REST endpoint URL
+SM59_DEST     │ ZBWJOB_TICKETS                            │ SM59 RFC destination name
+API_PATH      │ /api/v1/tickets                           │ Base path REST endpoint
 API_TOKEN     │ eyJhbGciOiJIUzI1NiIs...                  │ Bearer auth token
 TIMEOUT_SEC   │ 30                                        │ HTTP timeout (seconds)
 MAX_RETRY     │ 3                                         │ Max retry attempts
@@ -497,6 +508,8 @@ PACKET_SIZE   │ 20                                        │ Max jobs per run
 ```
 
 > Il token deve avere i permessi di **creazione** e **aggiornamento** ticket nel sistema esterno.
+
+> **SM59 setup:** creare la destinazione RFC HTTP in SM59 → tipo `G` (HTTP connection to external server). Configurare host, numero porta, eventuale path prefix e certificato SSL nel tab "Logon & Security". Il nome della destinazione deve corrispondere al valore di `SM59_DEST`.
 
 ### 6.2 Configurazione priorità (SM30 → ZBWJOB_PRIORITY)
 
@@ -528,37 +541,43 @@ Seguire rigorosamente questa sequenza per evitare errori di dipendenza:
 5. Creare e attivare `ZBWJOB_CONFIG` (Tabella)
 6. Eseguire conversione dati (SE14) se necessario
 
-### Step 2 — Dati di configurazione
+### Step 2 — Destinazione SM59
 
-1. SM30 → Vista `ZBWJOB_CONFIG`: inserire almeno `API_URL`, `API_TOKEN`, `SYSTEM_ID`
+1. SM59 → Creare destinazione RFC di tipo `G` (HTTP connection to external server) con il nome che sarà inserito in `SM59_DEST`
+2. Configurare host, porta, SSL e certificato nel tab "Logon & Security"
+3. Eseguire il connection test integrato in SM59 per validare raggiungibilità
+
+### Step 3 — Dati di configurazione
+
+1. SM30 → Vista `ZBWJOB_CONFIG`: inserire almeno `SM59_DEST`, `API_PATH`, `API_TOKEN`, `SYSTEM_ID`
 2. SM30 → Vista `ZBWJOB_PRIORITY`: inserire le regole di priorità base
 
-### Step 3 — Interfaccia (SE24)
+### Step 4 — Interfaccia (SE24)
 
 1. Creare `ZIF_TICKET_PROVIDER` con i tre metodi definiti
 
-### Step 4 — Classi (SE24), in ordine
+### Step 5 — Classi (SE24), in ordine
 
 1. `ZCL_BW_JOB_READER` — nessuna dipendenza su altre classi Z
 2. `ZCL_TICKET_DEDUP` — dipende da `ZBTW_TICKET_LOG`
 3. `ZCL_TICKET_HTTP_CLIENT` — implementa `ZIF_TICKET_PROVIDER`
 4. `ZCL_TICKET_FACTORY` — dipende da `ZCL_TICKET_HTTP_CLIENT` e `ZBWJOB_CONFIG`
 
-### Step 5 — Report (SE38)
+### Step 6 — Report (SE38)
 
 1. `ZBW_JOB_MONITOR` — dipende da tutte le classi precedenti
 2. `ZBW_TICKET_STATUS` — dipende da `ZBTW_TICKET_LOG`
 
-### Step 6 — Test isolato
+### Step 7 — Test isolato
 
 ```
 SE38 → ZBW_JOB_MONITOR → Eseguire con P_TEST = X
 ```
 Verificare che l'output mostri i job falliti senza errori di sintassi o runtime.
 
-### Step 7 — Test integrazione (facoltativo)
+### Step 8 — Test integrazione (facoltativo)
 
-Configurare `API_URL` puntando a un mock server (es. Postman Mock, RequestBin) e rieseguire con `P_TEST = ' '` per validare il payload HTTP e il parsing del ticket ID.
+Configurare la destinazione SM59 puntando a un mock server (es. Postman Mock, RequestBin) e rieseguire con `P_TEST = ' '` per validare il payload HTTP e il parsing del ticket ID.
 
 ---
 

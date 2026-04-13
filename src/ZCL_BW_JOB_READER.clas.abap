@@ -60,6 +60,7 @@ CLASS zcl_bw_job_reader IMPLEMENTATION.
 
   METHOD get_failed_jobs.
     DATA: lt_tbtco TYPE STANDARD TABLE OF tbtco,
+          lt_tbtcp TYPE SORTED TABLE OF tbtcp WITH NON-UNIQUE KEY jobname jobcount,
           ls_tbtco TYPE tbtco,
           ls_tbtcp TYPE tbtcp,
           ls_job   TYPE zbtw_fail_job,
@@ -77,6 +78,15 @@ CLASS zcl_bw_job_reader IMPLEMENTATION.
       WHERE status   = 'A'
         AND strtdate >= lv_date.
 
+    " Bulk-fetch all step logs in one query to avoid N+1 SELECT inside loop
+    IF lt_tbtco IS NOT INITIAL.
+      SELECT * FROM tbtcp
+        INTO TABLE lt_tbtcp
+        FOR ALL ENTRIES IN lt_tbtco
+        WHERE jobname  = lt_tbtco-jobname
+          AND jobcount = lt_tbtco-jobcount.
+    ENDIF.
+
     LOOP AT lt_tbtco INTO ls_tbtco.
       CLEAR ls_job.
       ls_job-jobname    = ls_tbtco-jobname.
@@ -91,10 +101,9 @@ CLASS zcl_bw_job_reader IMPLEMENTATION.
         TIME ZONE sy-zonlo
         INTO TIME STAMP ls_job-fail_tstamp.
 
-      " Retrieve the first error message from the job step log
-      SELECT SINGLE * FROM tbtcp INTO ls_tbtcp
-        WHERE jobname  = ls_tbtco-jobname
-          AND jobcount = ls_tbtco-jobcount.
+      READ TABLE lt_tbtcp INTO ls_tbtcp
+        WITH KEY jobname  = ls_tbtco-jobname
+                 jobcount = ls_tbtco-jobcount.
       IF sy-subrc = 0.
         ls_job-error_msg = ls_tbtcp-dyndtext(255).
       ENDIF.
@@ -107,9 +116,15 @@ CLASS zcl_bw_job_reader IMPLEMENTATION.
 
 
   METHOD get_failed_chains.
-    DATA: lt_chains TYPE STANDARD TABLE OF rspclogchain,
-          ls_chain  TYPE rspclogchain,
-          ls_job    TYPE zbtw_fail_job.
+    TYPES: BEGIN OF ty_logentry,
+             logid   TYPE rspclogentry-logid,
+             message TYPE rspclogentry-message,
+           END OF ty_logentry.
+
+    DATA: lt_chains     TYPE STANDARD TABLE OF rspclogchain,
+          lt_logentries TYPE SORTED TABLE OF ty_logentry WITH NON-UNIQUE KEY logid,
+          ls_chain      TYPE rspclogchain,
+          ls_job        TYPE zbtw_fail_job.
 
     DATA(lv_from) = calc_from_timestamp( iv_lookback_min ).
 
@@ -117,6 +132,15 @@ CLASS zcl_bw_job_reader IMPLEMENTATION.
       INTO TABLE lt_chains
       WHERE logstate IN ('E', 'A')
         AND starttime >= lv_from.
+
+    " Bulk-fetch all error log entries in one query to avoid N+1 SELECT inside loop
+    IF lt_chains IS NOT INITIAL.
+      SELECT logid message FROM rspclogentry
+        INTO CORRESPONDING FIELDS OF TABLE lt_logentries
+        FOR ALL ENTRIES IN lt_chains
+        WHERE logid    = lt_chains-logid
+          AND severity = 'E'.
+    ENDIF.
 
     LOOP AT lt_chains INTO ls_chain.
       CLEAR ls_job.
@@ -127,10 +151,12 @@ CLASS zcl_bw_job_reader IMPLEMENTATION.
                              iv_name  = |{ ls_chain-chain_id }|
                              iv_count = |{ ls_chain-logid }| ).
 
-      " Retrieve the first error-severity message from chain log
-      SELECT SINGLE message FROM rspclogentry INTO ls_job-error_msg
-        WHERE logid    = ls_chain-logid
-          AND severity = 'E'.
+      READ TABLE lt_logentries
+        WITH KEY logid = ls_chain-logid
+        INTO DATA(ls_entry).
+      IF sy-subrc = 0.
+        ls_job-error_msg = ls_entry-message.
+      ENDIF.
 
       ls_job-priority = get_priority( |{ ls_chain-chain_id }| ).
 

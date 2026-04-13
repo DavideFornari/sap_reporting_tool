@@ -86,6 +86,7 @@ START-OF-SELECTION.
                 IF lv_ext_status CS 'CLOSE'.
                   " Ticket was closed externally - sync local record, skip update
                   lo_dedup->mark_ticket_closed( ls_job-object_key ).
+                  COMMIT WORK AND WAIT.
                   WRITE: / |[SYNC]   Ticket { lv_existing } closed externally, local status synced for { ls_job-object_key }|.
                 ELSE.
                   lo_provider->update_ticket(
@@ -94,6 +95,7 @@ START-OF-SELECTION.
                   lo_dedup->mark_ticket_updated(
                     iv_object_key = ls_job-object_key
                     iv_message    = ls_job-error_msg ).
+                  COMMIT WORK AND WAIT.
                   WRITE: / |[UPDATE] Ticket { lv_existing } - { ls_job-object_key }|.
                 ENDIF.
               ELSE.
@@ -107,6 +109,7 @@ START-OF-SELECTION.
                 lo_dedup->save_new_ticket(
                   is_job       = ls_job
                   iv_ticket_id = lv_new_id ).
+                COMMIT WORK AND WAIT.
               ELSE.
                 lv_new_id = '[TEST - not created]'.
               ENDIF.
