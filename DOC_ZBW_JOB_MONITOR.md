@@ -15,12 +15,17 @@
 4. [Interfacce e Classi ABAP](#4-interfacce-e-classi-abap)
 5. [Report e Programmi](#5-report-e-programmi)
 6. [Configurazione](#6-configurazione)
+   - [6.1 Passo 1 — Destinazione HTTP in SM59](#61-passo-1--creare-la-destinazione-http-in-sm59)
+   - [6.2 Passo 2 — Parametri API in ZBWJOB_CONFIG](#62-passo-2--inserire-i-parametri-api-in-zbwjob_config)
+   - [6.3 Passo 3 — Regole di priorità in ZBWJOB_PRIORITY](#63-passo-3--configurare-le-regole-di-priorità-in-zbwjob_priority)
+   - [6.4 Requisiti minimi per il primo avvio](#64-requisiti-minimi-per-il-primo-avvio)
 7. [Deploy e Sequenza di Attivazione](#7-deploy-e-sequenza-di-attivazione)
 8. [Schedulazione SM36](#8-schedulazione-sm36)
 9. [Gestione Errori](#9-gestione-errori)
 10. [Manutenzione e Operatività](#10-manutenzione-e-operatività)
 11. [Estendibilità](#11-estendibilità)
 12. [Glossario Oggetti](#12-glossario-oggetti)
+13. [TODO / Verifiche Pendenti](#13-todo--verifiche-pendenti)
 
 ---
 
@@ -491,33 +496,136 @@ Utile per validare la lettura dei log SAP senza effetti collaterali.
 
 ## 6. Configurazione
 
-### 6.1 Prima configurazione (SM30 → ZBWJOB_CONFIG)
+Ci sono tre aree da configurare prima di avviare il monitor. Seguire l'ordine indicato: prima SM59, poi ZBWJOB_CONFIG, poi ZBWJOB_PRIORITY.
 
-Aprire la transazione SM30, inserire il nome della vista di manutenzione di `ZBWJOB_CONFIG` e popolare i seguenti record:
+---
+
+### 6.1 Passo 1 — Creare la destinazione HTTP in SM59
+
+SM59 gestisce host, porta e certificati SSL in modo centralizzato e sicuro, evitando di memorizzare URL completi in tabelle trasportabili.
+
+**Cosa ti serve prima di iniziare:**
+- URL base del tuo sistema di ticketing (es. `https://tickets.azienda.com`)
+- Eventuale certificato SSL da importare in STRUST (richiede supporto Basis)
+
+**Step 1.1 — Aprire SM59 e creare la destinazione**
+1. Aprire la transazione **SM59**
+2. Cliccare il pulsante **Crea** (o premere F5)
+3. Nel campo *Destination*, inserire un nome identificativo — es. `ZBWJOB_TICKETS` *(annota questo nome: servirà dopo)*
+4. Nel campo *Connection Type*, selezionare **G — HTTP connection to external server**
+5. Cliccare **Invio** per aprire il form di dettaglio
+
+**Step 1.2 — Tab "Technical Settings"**
+
+Compilare i seguenti campi:
+
+| Campo | Valore da inserire |
+|-------|--------------------|
+| Target Host | Solo il dominio, senza `https://` — es. `tickets.azienda.com` |
+| Service No. | `443` per HTTPS *(raccomandato)*, `80` per HTTP |
+| Path Prefix | Lasciare **vuoto** — il path viene gestito da `API_PATH` in ZBWJOB_CONFIG |
+
+**Step 1.3 — Tab "Logon & Security"**
+
+| Campo | Valore da inserire |
+|-------|--------------------|
+| SSL | Impostare su **Active** |
+| SSL Client Certificate | Selezionare il certificato corrispondente al server di destinazione (importato in STRUST) |
+| Logon Procedure | **Nessuna** — l'autenticazione avviene via Bearer token nell'header HTTP |
+
+**Step 1.4 — Testare la connessione**
+1. Cliccare il pulsante **Connection Test** in SM59
+2. Verificare che la risposta sia `200 OK` o `401 Unauthorized` *(entrambi confermano la raggiungibilità di rete — il 401 è atteso senza token)*
+3. Se il test fallisce con errore di rete o SSL, coinvolgere il team Basis prima di proseguire
+
+**Step 1.5 — Salvare**
+1. Cliccare **Salva** (Ctrl+S)
+
+---
+
+### 6.2 Passo 2 — Inserire i parametri API in ZBWJOB_CONFIG
+
+**Cosa ti serve prima di iniziare:**
+- Nome della destinazione SM59 creata al Passo 1
+- URL completo dell'endpoint API del tuo sistema di ticketing (dalla sua documentazione)
+- Un Bearer token valido con permessi di creazione e aggiornamento ticket
+
+**Step 2.1 — Aprire la vista di manutenzione**
+1. Aprire la transazione **SM30**
+2. Nel campo *Table/View*, inserire il nome della vista di manutenzione di `ZBWJOB_CONFIG`
+3. Cliccare **Maintain** (F5)
+
+**Step 2.2 — Inserire i parametri obbligatori**
+
+Creare un record per ciascuna delle seguenti chiavi cliccando **Nuova voce**:
+
+| CONFIG_KEY | Cosa inserire | Dove trovarlo |
+|------------|---------------|---------------|
+| `SM59_DEST` | Nome della destinazione SM59 — es. `ZBWJOB_TICKETS` | Creata al Passo 1 |
+| `API_PATH` | Path base dell'endpoint — es. `/api/v1/tickets` | Documentazione API del sistema di ticketing |
+| `API_TOKEN` | Bearer token — es. `eyJhbGciOiJIUzI1NiIs...` | Generato nel pannello API keys del sistema di ticketing |
+| `SYSTEM_ID` | Etichetta identificativa di questo sistema SAP — es. `BW4PRD` | Libero, comparirà nel corpo di ogni ticket |
+
+> **API_TOKEN:** il token deve avere i permessi di **creazione** (`POST`) e **aggiornamento** (`PUT`/`POST`) ticket. Verificare nella documentazione del sistema di ticketing come generarlo. In ambienti produttivi valutare la migrazione in `SECSTORE` per evitare esposizione in SM30.
+
+**Step 2.3 — Inserire i parametri opzionali**
+
+| CONFIG_KEY | Valore consigliato | Descrizione |
+|------------|-------------------|-------------|
+| `TIMEOUT_SEC` | `30` | Timeout in secondi per ogni chiamata HTTP. Aumentare se la rete è lenta o il sistema di ticketing è lento a rispondere |
+| `PACKET_SIZE` | `20` | Numero massimo di job elaborati per run. Utile per limitare il tempo di esecuzione in caso di mass failure. `0` = nessun limite |
+| `MAX_RETRY` | `3` | Informativo — non ancora enforced nel codice |
+
+**Step 2.4 — Salvare**
+1. Cliccare **Salva** (Ctrl+S)
+2. Assegnare a un ordine di trasporto se richiesto
+
+**Risultato atteso in tabella:**
 
 ```
 CONFIG_KEY    │ CONFIG_VALUE                              │ DESCRIPTION
-──────────────┼───────────────────────────────────────────┼─────────────────────────
+──────────────┼───────────────────────────────────────────┼──────────────────────────
 SM59_DEST     │ ZBWJOB_TICKETS                            │ SM59 RFC destination name
 API_PATH      │ /api/v1/tickets                           │ Base path REST endpoint
 API_TOKEN     │ eyJhbGciOiJIUzI1NiIs...                  │ Bearer auth token
-TIMEOUT_SEC   │ 30                                        │ HTTP timeout (seconds)
-MAX_RETRY     │ 3                                         │ Max retry attempts
 SYSTEM_ID     │ BW4PRD                                    │ System ID in ticket payload
+TIMEOUT_SEC   │ 30                                        │ HTTP timeout (seconds)
 PACKET_SIZE   │ 20                                        │ Max jobs per run (0 = no limit)
+MAX_RETRY     │ 3                                         │ Max retry attempts
 ```
 
-> Il token deve avere i permessi di **creazione** e **aggiornamento** ticket nel sistema esterno.
+---
 
-> **SM59 setup:** creare la destinazione RFC HTTP in SM59 → tipo `G` (HTTP connection to external server). Configurare host, numero porta, eventuale path prefix e certificato SSL nel tab "Logon & Security". Il nome della destinazione deve corrispondere al valore di `SM59_DEST`.
+### 6.3 Passo 3 — Configurare le regole di priorità in ZBWJOB_PRIORITY
 
-### 6.2 Configurazione priorità (SM30 → ZBWJOB_PRIORITY)
+**Cosa ti serve prima di iniziare:**
+- Elenco dei nomi dei job/chain/DTP critici nel sistema BW (da SM37 o RSA1)
 
-Inserire le regole di priorità dalla più specifica alla più generica. Il motore di matching valuta le regole nell'ordine in cui le trova (esatto prima, poi wildcard):
+> Questo passo è **opzionale** per un primo avvio. Se la tabella è vuota, tutti i job riceveranno priorità `MEDIUM` come default.
+
+**Step 3.1 — Aprire la vista di manutenzione**
+1. Aprire la transazione **SM30**
+2. Inserire il nome della vista di manutenzione di `ZBWJOB_PRIORITY`
+3. Cliccare **Maintain**
+
+**Step 3.2 — Inserire le regole**
+
+Cliccare **Nuova voce** per ogni regola. Compilare i campi:
+
+| Campo | Cosa inserire |
+|-------|--------------|
+| `CHAIN_PATTERN` | Nome esatto del job/chain oppure pattern con `*` (es. `ZBW_FIN*` copre tutti i job che iniziano con `ZBW_FIN`) |
+| `PRIORITY` | `HIGH`, `MEDIUM` oppure `LOW` |
+| `ACTIVE` | Mettere `X` per attivare la regola |
+| `NOTE` | Descrizione libera — utile per documentare perché quella priorità |
+
+> **Logica di matching:** il sistema cerca prima una corrispondenza esatta sul nome del job. Se non trovata, scorre le regole con wildcard nell'ordine in cui appaiono in tabella e si ferma alla prima corrispondenza. Inserire sempre le regole **dalla più specifica alla più generica**.
+
+**Esempio di configurazione:**
 
 ```
 CHAIN_PATTERN         │ PRIORITY │ ACTIVE │ NOTE
-──────────────────────┼──────────┼────────┼──────────────────────
+──────────────────────┼──────────┼────────┼──────────────────────────
 ZBW_FINANCE_CLOSE_EOD │ HIGH     │ X      │ Chiusura giornata Finance
 ZBW_FIN*              │ HIGH     │ X      │ Tutti i job Finance
 ZBW_HR*               │ HIGH     │ X      │ HR critical loads
@@ -525,6 +633,23 @@ ZBW_MASTER_DATA*      │ MEDIUM   │ X      │ Master data load
 ZBW_DELTA*            │ MEDIUM   │ X      │ Delta loads standard
 ZBW_TEST*             │ LOW      │ X      │ Job di test/sviluppo
 ```
+
+**Step 3.3 — Salvare**
+1. Cliccare **Salva** (Ctrl+S)
+
+---
+
+### 6.4 Requisiti minimi per il primo avvio
+
+Se vuoi avviare il monitor il prima possibile, i passi strettamente necessari sono:
+
+| # | Cosa fare | Dove |
+|---|-----------|------|
+| 1 | Creare destinazione SM59 verso il sistema di ticketing | SM59 |
+| 2 | Inserire `SM59_DEST`, `API_PATH`, `API_TOKEN`, `SYSTEM_ID` | SM30 → ZBWJOB_CONFIG |
+| 3 | Eseguire `ZBW_JOB_MONITOR` con `P_TEST = X` | SE38 |
+
+Il test in modalità `P_TEST = X` mostra i job falliti rilevati senza aprire alcun ticket reale, permettendo di verificare configurazione e connettività prima della messa in produzione.
 
 ---
 
@@ -747,6 +872,19 @@ Aggiungere un secondo step nel LOOP di `ZBW_JOB_MONITOR` che chiama `SO_NEW_DOCU
 | `ZCL_TICKET_FACTORY` | Class | Factory per il provider |
 | `ZBW_JOB_MONITOR` | Report | Orchestratore principale (SM36) |
 | `ZBW_TICKET_STATUS` | Report | Consultazione ALV + close manuale |
+
+---
+
+## 13. TODO / Verifiche Pendenti
+
+Questa sezione raccoglie le verifiche aperte e le attività da completare prima della messa in produzione.
+
+| # | Priorità | Componente | Descrizione | Come verificare |
+|---|----------|-----------|-------------|----------------|
+| 1 | **ALTA** | `ZCL_BW_JOB_READER` | **Verificare il valore esatto del campo status in `RSBKREQUEST` per i DTP falliti.** Il codice attuale usa `status = '8'` (assunto durante il test logico), ma non è stato confermato tramite SE11. Se il valore reale è diverso, i DTP falliti non vengono mai rilevati. | SE11 → `RSBKREQUEST` → campo "Stato di elaborazione tecnico" → dominio → valori fissi. Oppure: RSMO → trovare un DTP fallito noto → annotare il REQUID → SE16N → verificare il valore del campo status per quel record. |
+| 2 | **MEDIA** | `ZCL_BW_JOB_READER` | **Verificare il nome tecnico esatto del campo status in `RSBKREQUEST`.** Il codice usa il campo generico `status` ma il nome reale potrebbe essere diverso (es. `RSTSTATUS`). | SE11 → `RSBKREQUEST` → lista campi → cercare il campo corrispondente a "Stato di elaborazione tecnico" e confrontare con il nome usato nel WHERE. |
+| 3 | **MEDIA** | `ZCL_BW_JOB_READER` | **`DYNDTEXT` assente nel campione TBTCP.** Nel test logico il campo `DYNDTEXT` (testo errore del passo job) non era visibile nell'export CSV. Verificare che sia effettivamente popolato in produzione per i job abortiti, altrimenti i ticket vengono aperti con `description` vuota. | SE16N → `TBTCP` → filtrare per un job abortito noto → verificare se il campo `DYNDTEXT` contiene testo. |
+| 4 | **BASSA** | `API_TOKEN` | **Migrare il Bearer token da `ZBWJOB_CONFIG` a `SECSTORE`.** Attualmente il token è in chiaro in una tabella trasportabile e visibile in SM30. | Usare `CL_SECURE_STORE_SMC` per lettura/scrittura sicura e aggiornare `ZCL_TICKET_FACTORY→get_provider()`. |
 
 ---
 

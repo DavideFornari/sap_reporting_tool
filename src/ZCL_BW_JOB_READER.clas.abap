@@ -172,9 +172,10 @@ CLASS zcl_bw_job_reader IMPLEMENTATION.
 
     DATA(lv_from) = calc_from_timestamp( iv_lookback_min ).
 
+    " Status '8' = error/aborted in RSBKREQUEST (verify domain value in SE11 if behaviour is unexpected)
     SELECT * FROM rsbkrequest
       INTO TABLE lt_req
-      WHERE status    = 'E'
+      WHERE status    = '8'
         AND timestamp >= lv_from.
 
     LOOP AT lt_req INTO ls_req.
