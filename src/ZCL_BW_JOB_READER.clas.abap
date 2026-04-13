@@ -166,28 +166,34 @@ CLASS zcl_bw_job_reader IMPLEMENTATION.
 
 
   METHOD get_failed_dtps.
-    DATA: lt_req TYPE STANDARD TABLE OF rsbkrequest,
-          ls_req TYPE rsbkrequest,
-          ls_job TYPE zbtw_fail_job.
+    DATA ls_job TYPE zbtw_fail_job.
 
     DATA(lv_from) = calc_from_timestamp( iv_lookback_min ).
 
-    " Status '8' = error/aborted in RSBKREQUEST (verify domain value in SE11 if behaviour is unexpected)
-    SELECT * FROM rsbkrequest
-      INTO TABLE lt_req
+    " Aggregate by DTPNAME: one row per DTP regardless of how many parallel packets failed.
+    " Without GROUP BY, each failed packet produces a separate REQUID row, generating
+    " one ticket per packet for the same logical DTP failure.
+    " Status '8' = error/aborted (verify domain value in SE11 if no DTPs are detected).
+    SELECT dtpname,
+           MAX( timestamp ) AS timestamp,
+           MAX( requid )    AS requid,
+           MAX( msgv1 )     AS msgv1
+      FROM rsbkrequest
+      INTO TABLE @DATA(lt_req)
       WHERE status    = '8'
-        AND timestamp >= lv_from.
+        AND timestamp >= @lv_from
+      GROUP BY dtpname.
 
-    LOOP AT lt_req INTO ls_req.
+    LOOP AT lt_req INTO DATA(ls_req).
       CLEAR ls_job.
-      ls_job-jobname    = |{ ls_req-dtpname }|.
-      ls_job-job_type   = 'DTP'.
+      ls_job-jobname     = ls_req-dtpname.
+      ls_job-job_type    = 'DTP'.
       ls_job-fail_tstamp = ls_req-timestamp.
-      ls_job-object_key  = build_object_key(
-                             iv_name  = |{ ls_req-dtpname }|
-                             iv_count = |{ ls_req-requid }| ).
-      ls_job-error_msg   = ls_req-msgv1(255).
-      ls_job-priority    = get_priority( |{ ls_req-dtpname }| ).
+      " Object key uses DTP name only — REQUID intentionally excluded to prevent
+      " one ticket per failed parallel packet of the same DTP execution.
+      ls_job-object_key  = ls_req-dtpname.
+      ls_job-error_msg   = ls_req-msgv1.
+      ls_job-priority    = get_priority( ls_req-dtpname ).
 
       APPEND ls_job TO rt_jobs.
     ENDLOOP.
